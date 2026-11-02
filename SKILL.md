@@ -1172,4 +1172,1093 @@ live game**:
   the cut-out online part), placed into `mods/`, loaded by vanilla Fabric — a working
   offline client with no calls to the original's server.
 
-<!--PART-END-->
+## 16. Reconstructing render / UI / worldgen (defect classes)
+
+The reconstructed MC client loads but is "dead" because of CLASSES of reconstruction
+defects. Fix the CLASS of defect, not the instance — a systematic fix removes thousands
+of errors.
+
+### 16.1 Lost fields (cross-class)
+The reconstructor derives fields only from the METHODS of its own class → cross-class
+accesses are lost → NoSuchFieldError by the thousand. Fix: a standalone ASM scan of ALL
+field references (owner in-jar, name not `field_*`) → FieldAddPass adds ACC_PUBLIC fields.
+
+### 16.2 Lost record accessors and whole UI methods
+Reconstruction loses record accessors (→ AbstractMethodError) and whole methods of
+UI screens (`init/render` → empty screen). A stubbed method = a silently dead feature:
+an empty input handler (`onMouseClicked`=`return`) kills interactivity unnoticed. Fix:
+reconstruct the standard logic (iterate the list → `hovered(DD)Z` →
+`Runnable.run()`), wrap the action in try-catch(Throwable). Record: restore the
+fields + accessor→field (the ctor keeps the captured args).
+
+### 16.3 Render — often NATIVE or COLD (the ceiling)
+If the cheat was injected by native JVMTI: the modules' draw calls may be zeroed by an
+equal-length substitution (`GETSTATIC sf; POP; NOP; NOP` instead of `invoke draw`),
+the render entrypoints erased. OR render is Java virtual calls (f2=vtable-index),
+but the whole path is COLD (cpCache f1=f2=0, the GUI was not linked at dump time) → the
+draw targets are decoy/unrecoverable. Diagnostics: does the DLL draw MC? (look for
+`class_332`/`method_2xxxx`/`GetMethodID`/`CallVoidMethod`; only minimal raw GL
+glBegin/glVertex = a separate effect, not the HUD). Conclusion: **the only path to the
+visuals is a dump with a HOT render** (call-cpCache f1→Method* resolves the target
+bypassing the erased names). External wiring (constructing the modules, adding them to the
+manager's collections by category interfaces, running the native render/tick) revives the
+LOGIC but does not draw if the draw itself is erased/cold.
+
+### 16.4 Lost setShader
+The descrambler replaced `RenderSystem.setShader(program)` with `getShader();pop` OR cut
+it out → custom-shader draws (panels/icons/textures) render EMPTY while MC text
+renders. Fix: restore `getShader;pop→setShader` AND insert `setShader`
+before an orphaned `setShaderTexture` (the POSITION_TEX_COLOR shader).
+
+### 16.5 Wrong size source (scaled vs framebuffer)
+A custom UI lives in SCALED space (framebuffer÷guiScale). Reconstruction takes the
+framebuffer sizes (`method_4486`/getWidth=1920) instead of the scaled ones (`method_51421`/
+getScaledWindowWidth, or 4489/4507=960) → 2× zoom/off-screen drift. MethodCallRewriter
+maps 4486→4489, 4502→4507. The screen fields `field_22789/22790` (width/height) in an
+overlay context are 0 (the overlay draws before the screen's init) → force them from
+`method_51421/method_51443` at the start of render. Buttons `x=width/2−69+offset`;
+width=0 → off-screen (−69); width=framebuffer → drift to the right.
+
+### 16.6 Menu and the screen/overlay lifecycle
+- The menu = vanilla TitleScreen(class_442) + a mixin that @Inject-cancels the
+  vanilla one and does `client.method_1507(new CustomMenu())` → the menu is a real
+  clickable Screen.
+- On reload SplashOverlayMixin(class_425) draws the ACTIVE screen (field_1755) +
+  the intro, closes the overlay when the reload is ready + the fadeout is done → the MC
+  "ready" callback opens the TitleScreen → the mixin makes the menu active.
+- **Overlays (class_4071) do NOT pass clicks through to the screen.** The overlay is
+  stuck (reconstruction broke the close condition) → the menu draws but is NOT
+  interactive. Fix: remove the stuck fadeout wait (`fconst_2;fcmpl;iflt`→POP) → the MC
+  callback fires → the overlay closes normally → the menu is top-interactive. Do NOT
+  force setOverlay(null) early → black screen (field_1755 not ready). Distinguish the
+  close branch from the callback branch.
+- **Click routing:** the base `method_25402(DDI)` (MC mouseClicked) → int→enum →
+  `onMouseClicked(DD,enum)`. Buttons go through the Screen path → they require the menu
+  to be the ACTIVE screen. A separate clickgui path — through the event bus
+  (MouseMixin.onMouseButton sends MouseButtonEvent).
+- **Mixin blacklist:** the reconstructor auto-blacklists mixins with stubbed methods
+  (broken→null→NPE break MC: WindowMixin/LanguageMixin). Check WHICH jar is actually
+  loaded by the user (the blacklist may apply to a different jar than you build).
+  A mixin with intact bytecode can be returned — it will restore the feature.
+
+### 16.7 Render glyphs and adaptive color
+`drawIcon(label)` resolves the glyph in the font registry (code point 0xE0xx PUA) → if
+null, a texture fallback `ns:icons/<label>.png`. A font glyph through a BATCHED custom
+renderer may NOT flush in headless (immediate drawRoundedRect/Texture — do render).
+Adaptive text color: a boolean flag (light/dark background) selects dark vs WHITE;
+a broken brightness sample → dark text on a dark background — force WHITE. A custom
+FontRenderer, if natively loaded (null offline) → build it yourself from the bundled TTF
+(Font.createFont+deriveFont), assign it by reflection to all font fields of the singleton;
+the ctor often wants only one decode from a baked cache (no DES/seed). The gif/logo were
+positioned cover-fit to the framebuffer → they drifted; fix with the scaled sizes.
+
+### 16.8 Worldgen (entering the world): defect classes
+During reconstruction the worldgen path is massively "gutted": the ctor drops the captured
+args (`super();return`), accessor→`aconst_null`/`iconst_0`. Each one is a crash at a
+specific chunk-status step. Reconstruct against the vanilla reference (Yarn names are
+preserved), check with a headless harness (bootstrap + real BlockState/PalettedContainer,
+run the crashing path; on pristine reproduce the crash, on fixed it is clean):
+- **noise:** ChunkNoiseSampler (`forChunk`+`<init>`: cellWidth/Height from
+  NoiseSettings, finalDensity/aquifer). The AquiferSampler impl is often cut out entirely →
+  synthesize it as a NEW class (seaLevel variant: computeSubstance by density/water level).
+  getInterpolatedState = direct-compute (the interp cache is cut out → correct but slower
+  per-block).
+- **biomes:** `cachedClimateSampler`→MultiNoiseSampler; router→ctor mapping
+  (vegetation→humidity, continents→continentalness, ridges→weirdness).
+  `toParameterArray()[J` of length 7 (6 climate longs + a trailing 0L).
+- **surface:** SurfaceRules.ConditionSource LOST `extends Function` →
+  NoSuchMethodError apply(Object). Fix: return the iface Function. Condition.b()Z is
+  stripped in all subclasses → base b()→true ("all pass", real top materials instead of
+  bare stone). TestRule ProducedRule ctor keeps condition+followup,
+  tryApply=`!cond.b()?null:followup.tryApply`.
+- **carvers:** CarvingMask (minY:I+mask:BitSet, ctors `(II)`/`([J,I)`, get/set via
+  getIndex, toArray=mask.toLongArray).
+- **features:** BulkSectionAccess (level+Long2ObjectMap+lastSection; getSection via
+  computeIfAbsent→lambda acquire; close=release). **fastutil-lambda gotcha:**
+  invokedynamic for `Long2ObjectFunction`/`Long2IntFunction`/`Int2ObjectFunction` —
+  the SAM name = the PRIMITIVE method (`get(long)`/`get(int)`), NOT `apply`; a wrong name →
+  AbstractMethodError on `.get(long)` (LambdaMetafactory generates the method by the name
+  from indy). Check by the AME text.
+- **null tolerance:** buildSurface does `if(state!=null) setBlock` → a gutted-null
+  doesn't crash, the fix merely ADDS materials, it cannot break things.
+- **Homoglyphs:** `sg/\u044B\u042F\u042F` (U+042F) vs `sg/\u044B\u042F\u044F` (U+044F):
+  the glyph looks the same, the escape differs; twins break identification (distinguish
+  by escape/structure, not by glyph).
+- **Check where it is a defect and where a vanilla no-op** (the afterSpawn callback is
+  empty in vanilla — not a "defect"; getSpawnHeight→64 is the default, not a stub).
+  Breaking intact code under the guise of "harden" = a regression. Triage gutted classes
+  on-path vs off-path by the ASCII fingerprint (fix the worldgen core; postpone
+  entity-AI/particles/render post-processing).
+
+---
+
+## 17. Advanced data topping-up (when a cold dump is not enough)
+
+A single cold dump gives ~10-70% hot bodies; the rest is ciphertext/decoy/cold
+cpCache. Ways to top up (in increasing invasiveness):
+
+### 17.1 Hot dump
+Run more scenarios BEFORE the dump (enter the world, enable modules — the HUD draws =
+the cpCache is hot, render targets resolve). A hot dump removes the ceiling
+"render/wiring unrecoverable": call-cpCache f1→Method* gives the target bypassing the
+erased names. **A hot state (menu open, in the world) >> a dump of the boot pass >>
+a stateless dump.**
+
+### 17.2 Hot-carve (reading live memory without a dump file)
+A standalone EXE: UAC self-elevation → a quiet `OpenProcess(VM_READ|QUERY)`+`VirtualQueryEx`
++`ReadProcessMemory` (NO injection/debugger/WriteProcessMemory/MiniDump → invisible to
+usermode JVMTI/anti-debug) → builds an MDMP in RAM → reconstructs the hot metaspace with
+cpCache → writes loose `.class` files. Process lookup — by WINDOW TITLE (the launcher is
+also javaw.exe: `EnumWindows`+`GetWindowTextW`, take the PID of a visible window with the
+needed title, excluding the launcher). Chunked reading (1 MB at a time, skip a broken
+chunk). Monitor mode: wait for the number of target classes to grow → dump the new ones
+(render/HUD — in red). **Calibrate the offsets for the build** (Klass offsets depend on
+the JDK: `_methods`=0x180 vs 0x188 in another build → empty classes; calibrate against
+Object/String: a valid `_methods` = where Object.method0.vtable==String.method0.vtable).
+
+### 17.3 Late-attach agent + retransform
+When the classes are encrypted on disk but the JVM decrypts them: a late-attach agent
+(`jcmd JVMTI.agent_load <pid>` by the EXPLICIT pid — the protection may delete hsperfdata →
+it is invisible in `jcmd -l`, but the AttachListener is alive) → `RetransformClasses` fires
+ClassFileLoadHook. If the protection decrypts only on initial-load, retransform gives back
+the ENCRYPTED cached bytes — this is also a win: known-plaintext keystream (match the
+cipher blob against plaintext from a previous heap dump by length → keystream=C^P; the
+period is small (16) → the full key). Your own CFLH must be installed AFTER the protection's
+decryptor (the protection = a native JVMTI layer installs its CFLH before the user's → the
+user's sees the cipher).
+
+### 17.4 Inject-hook on a proxy-thunk / DefineClass
+A minimalist DLL hook (no debugger/agent): if jvm.dll is a small dummy of
+proxy-thunks (`jmp [rip+disp]` to JVM_DefineClass/WithSource), POINTER-SWAP the thunk
+to your handler → it dumps every class at define time (decrypted). If the Loader calls
+JNI DefineClass (not JVM_*), patch the JNINativeInterface table (`env->functions+0x28`).
+A blind classDecrypt locator: a VEH-validated scan of the first 0x600 bytes of
+JVM_DefineClassWithSource for `CA FE BA BE`/cmp-magic, try the first 3 `E8` calls in the
+window as candidates — one will return CAFEBABE from the blob → cache it and call it on
+every encrypted class.
+
+### 17.5 VEH + hardware breakpoint on parseClassFile (raw capture)
+A Vectored Exception Handler + a Dr0 hardware breakpoint on the `parseClassFile` RVA →
+dumps the raw class bytes BEFORE decryption/BEFORE the container WIPES them (anti-dump:
+the container is erased after parsing → the plaintext is NOT in the dump). Nothing is
+lost. Works when a regular CFLH is blocked by anti-dump.
+
+### 17.6 Metaspace-only recovery (when the classfile buffer is not cached)
+The Voile/Rockstar class: ClassFileParser consumes the buffer (does not cache it) → the
+original classfile is not in memory (only auto-`$$Lambda` with CAFEBABE) → carving
+CAFEBABE is useless. The only path is to rebuild from the InstanceKlass (ConstantPool +
+Array<Method*> + ConstMethod), i.e. the standard reconstructor. It requires your own walker
+for the LAYOUT OF THE SPECIFIC build (there are no public offsets for a custom JDK —
+calibrate).
+
+### 17.7 Force-loading (recovering uncalled classes)
+Patching jopt-simple/OptionParser.parse → `Class.forName(name,false,loader)` for all names
+(section 9.1) forces the JVM to define and partially decode the cold classes.
+**force-loaded ≠ linked:** CP Class entries are UNRESOLVED (tag 100/101/103, not 7), the
+cpCache is empty, the bytecode is NOT rewritten (the operands are the original BE CP
+indexes, de-rewrite is NOT needed). collectFields/resolve must accept all 4 tags
+(7/100/101/103), otherwise fields/references are lost.
+
+## 18. Catalogue of blockers and countermeasures (anti-dump/obfuscation → how to bypass)
+
+Protection mechanisms from real clients and what to do about them. "A blocker is not a
+wall": everything on disk is reversible, it is a question of depth. Look for a backup
+route (deeper into the dump/heap/trace), not for a stub.
+
+### 18.1 Process level (hinder taking a dump)
+- **DACL deny-all** on OpenProcess for non-admin → SeDebug/admin gets through. A blocker
+  only for non-admin.
+- **SizeOfImage inflation** (PEB Ldr DllBase+0x40=0x7F000000) → a naive Scylla reads
+  garbage; read by the VAD directly (VirtualQueryEx), ignore the PEB.
+- **PE section-table scramble (XOR)** in-memory → Scylla sees garbage VA/sizes;
+  the bypass is injecting into a carrier process or a metaspace walk, not a PE dump.
+- **Freeze watchdog** (an external exe that kills the JVM if the heartbeat freezes while a
+  foreign VM_READ handle exists) → freeze the watchdog in ProcessHacker BEFORE the dump,
+  or live-read without freezing (hot-carve 17.2).
+- **Dump bloat** (commits 256 MB of junk upon detecting a foreign VM_READ → a 100+ GB dump) →
+  a live-read dumper without full-memory, or kill the bloat thread.
+- **Forbidden-process detect** (Toolhelp32 by the names ida/x64dbg/dnspy/frida/
+  cheatengine/claude/…→kill) → rename the tool (it detects by name).
+- **Self-unmapping of the native layer** after injection (post factum the region is
+  empty) → catch it AT THE MOMENT OF INJECTION (diff of new regions); the decrypted Java
+  client stays in the heap.
+
+### 18.2 Metaspace/class level (hinder reconstruction)
+- **Erased method/field names** (name_idx→garbage): the holder via cpCache f1 is CORRECT,
+  the name/desc are corrupted → resolve via f1→Method*→holder-CP, or a unique (owner,desc)
+  match, or `_resolved_klasses` cp+0x28 (CPKlassSlot: rki=low16, name_idx=high16).
+- **Decoy descriptors on refs** (NameAndType poisoned): the call-site desc from the
+  Methodref slot WINS over the decoy; on an arity desync the call-site wins,
+  the name is re-resolved by (owner, call-site-desc).
+- **Equal-length opcode substitution** (same length: `sipush 16;iushr`→`getstatic decoy;
+  ixor`, `invoke`→`POP;NOP;NOP`): de-tamper by semantics; POP;NOP;NOP = the place of a
+  zeroed register/draw call.
+- **Erased `<clinit>`/`<init>`** (body in place, name zeroed): <init> by the xref
+  `invokespecial …)V`+fallback vtable_index==−2; <clinit> by static+()V+putstatic-into-
+  own-field+unique.
+- **Erased enum-`<clinit>`** (cs=0): synthesize from fieldinfo ACC_ENUM(0x4000),
+  order by offset=ordinal.
+- **Decoy types of primitive fields** (an int field marked with the ref-desc
+  `[Ljava/lang/Class;`): dataflow — the field goes into int arithmetic and nowhere as a
+  ref → retype to I. tos_state is UNRELIABLE (anti-dump corrupts it).
+- **Layout padding** (a custom build adds fields to ConstMethod/ConstantPool/
+  Klass → hardcoded offsets are invalid): AUTO-CALIBRATE against anchor classes, don't
+  hardcode.
+- **Custom Symbol layout** (`[u4 length][utf8]` without hash; or per-launch XOR keys on
+  length/name_idx/desc_idx/code_len): calibrate against a method with a preserved opcode.
+- **Decoy InstanceKlass** (thousands of fakes with plausible names in the C-heap → they
+  poison the vtable histogram): filter by chain validation (CP back-ptr pool_holder, Method
+  vtable-match).
+- **Attribute-name wipe** (Code/StackMapTable/LineNumber Utf8→U+200B; + zeroing the bodies
+  of LocalVariableTable/StackMapTable): restore the attribute names manually (the list is
+  standard); the debug info (local names) is lost irrevocably.
+- **Header opaque CP / tag-permutation** (the whole CP is an XOR keystream / the tags are
+  affine-permuted): decrypt the keystream (splitmix per-class) / reverse the affine
+  (inverse s2t table). Normalize the internal tags: 100/101(UnresolvedClass)→7, 102/StringIdx→8.
+
+### 18.3 Body/class encryption
+- **Per-method lazy encryption + gate-bit** (the body is cipher in the metaspace, decoded
+  on the first call, cached): a hot dump catches the executed plaintext; a marker
+  (e.g. Method+0x30==0x1700, ConstMethod+0x32&0x18 — verify by build) marks the
+  encrypted ones. Cold (uncalled) ones remain cipher → top up with a hot dump/agent.
+- **Transient re-encryption sweep** (~2s idle → re-encrypt methods not on the stack):
+  dump during execution; methods in a live frame = plaintext, the rest is cipher → you
+  need a "hot" moment.
+- **splitmix64/ISR keystream** (section 8.3): the seed is recovered from known plaintext;
+  the per-method seed may be a function of the native code → emulate the computor (8.4).
+- **Feedback-cipher (not positional):** the keystream depends on the PREVIOUS bytes (proof:
+  the same plain→different ks) → positional MTP is impossible, a sequential decode/emulation
+  of the whole body is needed.
+- **Repeating-XOR class cipher (16 bytes, build-fixed):** a critical hole — one
+  known header (CAFEBABE) cracks the whole key (known-plaintext keystream,
+  period=key length).
+- **Session/server-bound key** (masterKey = base ⊕ keyshare from the backend; or in the heap
+  as a static-final of the final value): get the keyshare/masterKey from runtime memory —
+  then decrypt offline; the masterKey may be on a mini-VM (loadMasterKey) → harder
+  statically, take it from memory after initialization.
+
+### 18.4 VM virtualization and native (the toughest)
+- **Bytecode virtualization** (GayVM/Voile/JTC/VxLang VM: opcodes 0xEE-0xFF, a prologue
+  marker, per-opcode salts, global seeds in jvm.dll): de-virtualization is reversing the
+  interpreter (find the seeds/salts in the image, murmur/splitmix key-derivation), or
+  live-capture via HWBP on dispatch. Part of the methods (no prologue, plain fast)
+  is recoverable normally; part (scrambled without per-address salt) — only live.
+- **x87 anti-emulation** (seed via fsin/fcos/fyl2x): a host-FPU emulator, not Unicorn's
+  soft-FPU (see 15.6).
+- **Native obfuscation (j2c/native-obfuscator):** the method is ACC_NATIVE, the
+  implementation is in a DLL. Unbound ones (native_function@+0x58==0) are not called → they
+  don't affect the runtime. The bound ones — lift (section 10): the map from
+  RegisterNatives (it may be memset after registration → take it before/from another
+  place); the string_pool from the heap (Unicorn emulation of
+  `__ngen_funcs` gives the plaintext name+desc for free).
+- **JVMTI/agent strips** (-javaagent/-agentpath→JNI_ERR, AttachListener off): dump/
+  hot-carve/inject-hook instead of dynamic-attach.
+- **Caller-gate on decrypt** (returns NULL if the return-address is not in jvm.dll):
+  call decrypt through an RVA from a legitimate module, or inline-hook the native decryptor.
+- **Anti-hook (baseline-prologue detour-detect → kill):** overwrite the prologue before
+  the divergence check (at boot), or work with passive reading/dumping, without hooks.
+
+The general principle: **dump/heap = ground truth**. When the reconstruction produces
+garbage — the raw bytecode + cpCache f1 hold the right answer. A systematic fix removes a
+CLASS of errors. A crash trace is a GIFT (it proves the path executed) — read it as the
+pipeline map. Change ONE thing at a time, isolate the cause with a binary search (position
+vs size vs source). "Impossible" is not a conclusion: formulate "need time / need a hot
+dump / need the key from runtime".
+
+---
+
+## 19. Pitfalls (a quick list)
+
+- Offsets between JDKs are NOT a uniform shift. Always verify against anchor classes.
+- One JDK major ≠ one cpCache layout (legacy entry vs resolved arrays).
+- Calibration falsely triggers on some builds — there, resolve by exports.
+- invokedynamic JDK21+: the operand is DIRECT, not a complement.
+- `code_size` lies (truncated/stretches into garbage) — look for the natural end.
+- Neutralize the canary BEFORE computing the length, nop the whole instruction.
+- decoded bytes (from the native decoder) are pre-link, they do NOT need de-rewrite.
+- A full CFG-worklist in verify kills valid methods (handlers depth=1).
+- Unicorn 2.1.4: SSE comparisons glitch on repeated calls — isolate them.
+- Build the Java 8 patch jar with the system `zip`, not the `jar` of a new JDK.
+- An anonymous class in the patch → an extra `$1.class` → NoClassDefFound.
+- JVMTI capability breakpoint/local-var — onload-only, load with `-agentpath`.
+- Cache the calibration on disk — otherwise every probe rescans the dump (~55s).
+- Don't confuse an opcode remap (valid code) with body encryption (high entropy).
+- An FFI native is not taken by the decoder — it is a lift, not a decryption.
+- Offsets of a custom fork "drift" AS A WHOLE, not as a uniform shift — calibrate against
+  Object/String, don't extrapolate from a neighboring version.
+- Vineflower/Recaf are STRICTER than CFR/javap: the obfuscator puts ACC_SYNTHETIC(0x1000)
+  on all methods/fields → Vineflower HIDES them (the class looks empty, "98% garbage") →
+  strip 0x1000 (method mask 0x0dff, field 0x40df); ACC_ENUM with a broken `<clinit>`
+  crashes the Vineflower EnumProcessor → strip ACC_ENUM.
+- MC names must not be printed into bash/source (non-ASCII/starting with a digit) — code points
+  `cp:hex`, structural identification; don't rebuild the jar with python-zipfile (CP437
+  corrupts kana) — only `jar`.
+- Windows case-insensitivity collides names (`Il`/`iI`, `net/40c`/`40C`) —
+  ASM over the jar + a case-sensitive Python `zipfile` for the exact entry.
+- fastutil lambda: the SAM name in indy = the primitive method (`get(long)`), NOT `apply` —
+  otherwise AbstractMethodError.
+- SurfaceRules.ConditionSource without `extends Function` → NoSuchMethodError apply(Object)
+  at the surface step of worldgen — return the iface Function.
+- render/wiring zeroed with POP;NOP;NOP or a cold cpCache (f1=f2=0) → the visuals are
+  unrecoverable from a COLD dump; a HOT one is needed (menu/in the world) — not "impossible".
+- x87 anti-emulation (fsin/fcos in the key derivation) breaks Unicorn's soft-FPU → host-FPU.
+- The classfile container/buffer may be WIPED after parsing → the plaintext is NOT in the dump;
+  take it from the metaspace or with VEH+HWBP on parseClassFile before the wipe.
+- Don't break intact worldgen/UI code under the guise of "harden" — that is a regression; fix
+  only a proven defect (repro the crash on pristine, clean on fixed).
+
+---
+
+## 20. Report format
+
+In plain language, without bureaucratese or emoji, following the structure:
+
+1. **What the protection is** — JDK version, whether the JVM is custom, how the JAR is
+   encrypted, where decryption happens (Java loader / native JVM / FFI), a rough estimate
+   of the strength (all code open in the metaspace ~2/10; lazy body encryption ~6/10; plus
+   a native lift — higher).
+2. **What I got** — X/Y classes, of which Z decompile cleanly (CFR/Vineflower).
+3. **How I got it** — offsets (exports/calib), de-rewrite, topping up the cold ones
+   (decoder emulation / jopt-patch / JVMTI).
+4. **What is left and why** — cold ciphertext (never called), FFI native
+   (a lift is needed), obfuscation (flattening — untouched on request).
+5. **Delivery** — the path to the classes folder, `*-reconstructed.jar`,
+   the decompiled sources, README.
+
+Separate facts from hypotheses. If an offset is not confirmed or a seed is not derived —
+say so, don't pass a guess off as a result. A previous wrong conclusion (e.g. "the key
+is unrecoverable") — mark it outright as refuted if new data removed it.
+
+---
+
+## 21. Importing the skill (Claude Code and Codex)
+
+The skill is self-contained — it is a single file. It installs into both agents. It does
+not depend on a specific machine: all tools are named by role, the local paths are your own.
+
+### Claude Code
+Put the file at the path (the folder = the skill name = the slash command):
+```
+~/.claude/skills/sp1cyreverse/SKILL.md
+```
+Invoke — `/sp1cyreverse` in a session, or it triggers automatically by the description
+(when asked to "pull the classes out of the dump" etc.). For a specific repository you can
+put a copy at `<repo>/.claude/skills/sp1cyreverse/SKILL.md` — then the skill is
+visible only there. To check that it was picked up: in a new session the skill will appear
+in the list of available ones; nothing needs to be restarted.
+
+Moving to another machine — just copy the skill folder into its `~/.claude/skills/`.
+No other files from this repository are required for the skill to work — all the
+knowledge is inside SKILL.md.
+
+### Codex (OpenAI Codex CLI)
+Codex picks up custom slash commands from markdown files in `~/.codex/prompts/`.
+We put the skill body there (without the YAML frontmatter, it is needed only by Claude):
+```bash
+mkdir -p ~/.codex/prompts
+# cut both '---' frontmatter delimiters, the rest goes into the command file:
+sed '1,/^---$/d; 1,/^---$/d' ~/.claude/skills/sp1cyreverse/SKILL.md \
+  > ~/.codex/prompts/sp1cyreverse.md
+```
+If your `sed` version is picky — just open SKILL.md and copy everything after
+the second `---`. Invoke in Codex — `/sp1cyreverse`. Alternatively, the content can be
+pasted into the project's `AGENTS.md` as a "Reconstruction playbook" section — then Codex
+keeps it in context permanently, without a slash.
+
+### Checking after import
+Give the agent a test task: "pull the classes out of this dump, jvm.dll is custom,
+JDK 21" and a path to the `.dmp`/`.jar`. The skill should: determine the JDK version, choose
+exports-vs-calib, start from the anchor classes, and not hardcode offsets. If it goes
+straight for ready-made numbers without verification — it picked up the wrong file.
+
+## Appendix A. Map of the reconstructor's modules
+
+If the reconstructor is implemented modularly (recommended), a new project = pinpoint
+edits for the specific JDK and protection. A typical module layout and what to change in
+them:
+
+| Module | What it is responsible for | What we change for a new build |
+|---|---|---|
+| layout / offsets | Field offsets of all structures (Klass/IK/CP/Method/ConstMethod/cpCache) | The offset numbers; the ConstMethod tail; resolved-entry strides |
+| calib | Self-calibration with exports cut out (vtable voting, anchor on java/lang/*, chain validation, cache) | Enable/disable; the list of anchor classes |
+| context | Choice of exports→calib; dynamic metaspace range | Fallback, metaspace boundaries |
+| derewrite | Unwrapping quickened opcodes, reading cpCache entries, operand remap | cpCache type (legacy/resolved), indy operand, opcode remap |
+| codelen | Natural code length (needed), switch/is_term | End-of-method logic for the obfuscation |
+| verify | Detection of a cold/broken body → native stub | Thresholds; strict mode; which opcodes count as ciphertext |
+| method_one | Assembling a single method: access, read window, dump/decoded choice | Flag normalization; try-dump-first; OFFLINE_STUB |
+| exceptions | Filtering the exception table by instruction boundaries | ConstMethod flags/size offsets |
+| assemble | Assembling the ClassFile, cleaning fake annotations, batch | build_ik without a re-scan |
+| code | Bytecode transform, canary neutralization | marker-opcode→nop before the maps gate |
+| opcode-table | The stock quickened set table for the build | A new file for every JDK major |
+
+Useful commands of such a tool:
+```
+batch <dump> batch <out> <package/prefix>   # bulk reconstruction of a package
+cpcache <class>        # dump the class's raw cpCache (probe the offsets)
+methprobe <class>      # raw Method/ConstMethod bytes
+moddump 'natives\x.dll' out   # cut a native module out of the dump
+```
+Env switches (example): the dump path, the image extension, the path to the decrypted
+bodies from the Unicorn lift, the OFFLINE_STUB flag.
+
+---
+
+## Appendix B. Rebuilding the constant pool (details)
+
+CP slots are indexed 1..length−1. `_tags[i]` — the slot type, the slot — the value.
+The main tags (the JVMS standard, custom JVMs have the same):
+
+| Tag | Name | What is in the slot |
+|---|---|---|
+| 1 | Utf8 | length + bytes (a string) |
+| 3 | Integer | int |
+| 4 | Float | float |
+| 5 | Long | long (occupies 2 slots!) |
+| 6 | Double | double (2 slots) |
+| 7 | Class | Utf8 index (the name) |
+| 8 | String | Utf8 index |
+| 9 | Fieldref | class_index + name_and_type_index |
+| 10 | Methodref | class_index + name_and_type_index |
+| 11 | InterfaceMethodref | like Methodref |
+| 12 | NameAndType | name_index + descriptor_index |
+| 15 | MethodHandle | ref_kind + ref_index |
+| 16 | MethodType | descriptor Utf8 index |
+| 17 | Dynamic | bootstrap_attr_idx + name_and_type |
+| 18 | InvokeDynamic | bootstrap_attr_idx + name_and_type |
+| 19 | Module / 20 Package | Utf8 index |
+
+Rebuild pitfalls:
+- Long/Double occupy TWO slots — the next index is skipped. Don't lose count,
+  otherwise the whole pool shifts.
+- In memory the class slots may already be RESOLVED (a pointer to the Klass, not a Utf8
+  index) — take the name from `_resolved_klasses` or from the Klass._name itself and write
+  it back as Class→Utf8.
+- A Symbol in HotSpot is not a bare string: a header (refcount/hash/length) + bytes.
+  Read the length from the header, then the bytes.
+- `_source_file_name_index`, `_major/_minor_version` from the ConstantPool go into the
+  class attributes.
+- BootstrapMethods (for indy/Dynamic) is a separate class attribute; the operands are in
+  `_operands`. Without it invokedynamic won't assemble.
+
+---
+
+## Appendix C. Skeleton of a Unicorn lift of the native decoder
+
+The point: not to reverse the crypto by hand, but to let the JVM's own native decoder run
+on the dump memory. Lazy paging of pages from the dump gives the code access to the
+keys/tables exactly as in the live process.
+
+```python
+from unicorn import *
+from unicorn.x86_const import *
+import mini  # dump reader: mini.read(va, n)
+
+BASE = 0x140000000            # ImageBase of jvm.dll/.exe from the dump
+DECODER = BASE + 0x3a0640     # address of the per-method decoder (find by disassembly)
+
+uc = Uc(UC_ARCH_X86, UC_MODE_64)
+
+def map_page(uc, access, va, size, user):     # lazy mapping from the dump
+    page = va & ~0xFFF
+    data = mini.read(page, 0x1000) or b"\x00"*0x1000
+    uc.mem_map(page, 0x1000)
+    uc.mem_write(page, data)
+    return True
+
+uc.hook_add(UC_HOOK_MEM_UNMAPPED, map_page)
+
+STK = 0x200000; uc.mem_map(STK, 0x100000)
+uc.reg_write(UC_REG_RSP, STK + 0x80000)
+
+# ABI (example): rcx=codes, edx=len, r8=constants(0x20 bytes), r9=table256, [rsp+0x28]=key
+uc.reg_write(UC_REG_RCX, CODES_VA)
+uc.reg_write(UC_REG_RDX, code_len)
+uc.reg_write(UC_REG_R8,  CONSTS_VA)
+uc.reg_write(UC_REG_R9,  TABLE_VA)
+uc.mem_write(uc.reg_read(UC_REG_RSP)+0x28, key.to_bytes(8,"little"))
+
+uc.emu_start(DECODER, DECODER_RET)         # find RET by disassembly (ret after the loop)
+decoded = uc.mem_read(CODES_VA, code_len)  # the body is decrypted in place
+```
+
+Subtleties:
+- To capture the per-class ones (key + pointers to constants/table): set a hook
+  on the loop-RIP inside the class decoder and read the registers — then you call the
+  per-method one directly on any method.
+- Forcing the decode of a hot class: reset the "decoded" bit in the class flag +
+  set the gate bit, grab the key, call the decoder.
+- Check determinism: two decodes of the same class → the same key (so it doesn't depend
+  on the state — it also works for hot ones).
+- Unicorn 2.1.4: SSE comparisons (comiss/cmpss) glitch on repeated calls —
+  emulate float logic in isolation.
+- Put the result into a file, the reconstructor takes it; decoded is pre-link
+  standard bytecode, do NOT apply de-rewrite to it.
+
+### C.1 Why emulation instead of manual crypto reversing
+The body/string decoder is a deterministic function of (position, key, tables).
+The key and the tables are computed by the native code on the fly and may not lie in the
+dump as ready values. Instead of recovering the formula by hand (long,
+error-prone), we let the native code itself run in a sandbox on top of the dump
+memory: it will raise the key from its own sources and decrypt. Lazy paging of
+pages (`UC_HOOK_MEM_UNMAPPED` → `mini.read` → `mem_map`+`mem_write`) means
+that the emulator has access to the whole process memory at dump time, as if it were live.
+All you need is to know the ABI of the entry function (which registers/stack = arguments)
+and the return address.
+
+### C.2 Emulating JNI_OnLoad for the native method map (lift)
+For lifting hardened native code (section 10.3), with the same Unicorn we emulate `JNI_OnLoad`,
+feeding it a fake `JNIEnv`/`JavaVM`, in order to intercept `RegisterNatives`,
+`FindClass`, `GetMethodID`:
+```python
+# JNIEnv is a pointer to a table of function pointers. We put a fake table there
+# where each slot points to a unique "trap" address; we catch calls with a CODE hook and
+# emulate the needed ones (RegisterNatives/FindClass/GetMethodID/GetFieldID).
+def on_code(uc, addr, size, _):
+    if addr == TRAP_RegisterNatives:      # (env, clazz, methods*, count)
+        methods = uc.reg_read(UC_REG_R8)  # win64: 3rd arg
+        count   = uc.reg_read(UC_REG_R9)
+        for i in range(count):            # JNINativeMethod{ name*, sig*, fnptr }
+            base = methods + i*24
+            name = cstr(uc, uc.mem_read(base, 8))
+            sig  = cstr(uc, uc.mem_read(base+8, 8))
+            fn   = int.from_bytes(uc.mem_read(base+16, 8), "little")
+            MAP[fn] = (name, sig)         # fnptr -> Java signature
+        do_ret(uc)                        # emulate ret, return 0
+    elif addr == TRAP_FindClass:
+        ...  # remember the class string, return a fake jclass handle
+uc.hook_add(UC_HOOK_CODE, on_code)
+```
+The result is a dictionary `fnptr → (Java method, signature)`. Then for each `fnptr`: if it
+is pure (no JNI calls) — emulate it and compare I/O; if it is object-based — parse the
+`FindClass/GetMethodID/CallX` sequence and assemble the equivalent
+Java method (section 10). The XOR name blob is decrypted by the same run (by the end
+of `JNI_OnLoad` the `gClass/gMeth/gFld` cache is filled — we take it from memory).
+
+### C.3 Native-static-lift: recover names/strings by EMULATING the native code
+If the native code (native-obfuscator/j2c of the radioegor146 kind) encrypts `string_pool`
+and XORs the indexes (class/method/field names and strings are encrypted in the .dll and
+resolved at runtime), don't reverse the crypto by hand — EMULATE it and take the ready
+result:
+- Cut the native module out of the dump (`moddump`), raise it in Unicorn with lazy
+  paging of dump pages (like C).
+- Read the encrypted `string_pool` from the heap/image (the global `pool_ptr` at a
+  known RVA + additional pointers), or let the emulated code decrypt it itself.
+- Run the name decoder/`__ngen_funcs` on the indexes → plaintext name+desc. Pointer
+  provenance (this→ALOAD 0, GetObjectField/Call result-carry, receiver chains) builds an
+  expression tree per instruction → they restore the method body.
+- A side effect: by the end of the run the name cache (`gClass/gMeth/gFld`) is filled — you take it
+  from memory, the name encryption is "defeated for free". Offline boot of such clients: a JVMTI agent
+  injects `pool.bin`, hooks the obfuscator's VM stub → void, up to the menu.
+
+## Appendix D. Skeletons for topping up classes
+
+### D.1 JVMTI agent (Rust cdylib): mechanics
+JVMTI works ON a live process (not on a dump) and sees the bytecode of any class
+regardless of the loader — this is the most reliable top-up. The idea: make the JVM once
+again "show" the classfile of every loaded class through `ClassFileLoadHook`,
+which fires on load AND on `RetransformClasses`.
+
+Mechanics step by step:
+```rust
+// Entry point. Load as -agentpath: the retransform/breakpoint/
+// local-var capabilities are available ONLY in the onload phase. Cross-build for win: x86_64-pc-windows-gnu.
+#[no_mangle]
+pub extern "system" fn Agent_OnLoad(vm: *mut JavaVM, opts: *const c_char,
+                                     _r: *mut c_void) -> jint {
+    let jvmti = get_env(vm, JVMTI_VERSION_1_2);              // (*vm).GetEnv(...)
+    let mut caps: jvmtiCapabilities = zeroed();
+    caps.set_can_retransform_classes(1);
+    caps.set_can_generate_all_class_hook_events(1);
+    caps.set_can_tag_objects(1);
+    // to intercept a byte[] in the transformer method:
+    caps.set_can_generate_breakpoint_events(1);
+    caps.set_can_access_local_variables(1);
+    (*jvmti).AddCapabilities(&caps);
+
+    let mut cbs: jvmtiEventCallbacks = zeroed();
+    cbs.ClassFileLoadHook = Some(on_class_file_load);       // <- the bytes arrive here
+    cbs.ClassPrepare      = Some(on_class_prepare);
+    cbs.Breakpoint        = Some(on_breakpoint);
+    (*jvmti).SetEventCallbacks(&cbs, size_of::<jvmtiEventCallbacks>() as i32);
+    (*jvmti).SetEventNotificationMode(JVMTI_ENABLE, CLASS_FILE_LOAD_HOOK, null_mut());
+    0
+}
+
+// ClassFileLoadHook: name — the class name, class_data/len — the raw classfile.
+extern "system" fn on_class_file_load(
+    _j: *mut jvmtiEnv, _e: *mut JNIEnv, _cls: jclass, _loader: jobject,
+    name: *const c_char, _pd: jobject, len: jint, data: *const u8,
+    _new_len: *mut jint, _new_data: *mut *mut u8)
+{
+    let n = cstr(name);
+    if n.starts_with(TARGET_PREFIX) {                        // target package
+        let bytes = slice::from_raw_parts(data, len as usize);
+        jar_put(&format!("{n}.class"), bytes);               // write into the output jar
+    }
+}
+```
+Then in a separate thread (after startup): `GetLoadedClasses` → filter the
+target package → `RetransformClasses(list)`. The retransform runs every
+class through `ClassFileLoadHook` again, and the bytes already assembled by the JVM arrive
+there (without our modifications, if we don't touch `new_data`) → we drain them into the jar.
+This way we take even the classes defined from a native buffer.
+
+Subtleties:
+- Injecting into an already running process (`DllMain` + `AttachCurrentThread` +
+  `GetEnv`) gives error code 98 (`JVMTI_ERROR_MUST_POSSESS_CAPABILITY`) on
+  breakpoint/local-var — these capabilities are granted only at onload. So for them
+  launch with `-agentpath:agent.dll`, not a late inject.
+- Bytes that the loader PARSES but does not define as classes (e.g. a blob with
+  mixins that the protection reads into a `byte[]` and hands out in parts): their
+  ClassFileLoadHook won't show them. Then: on `ClassPrepare` of the needed class set
+  `SetBreakpoint` on the method that receives this `byte[]` (e.g.
+  `addTransformer([B)V`); in the `Breakpoint` callback take the argument via
+  `GetLocalObject(thread, depth=0, slot)` and read `GetByteArrayRegion` → jar.
+- `jar_put` — a simple zip writer (the `zip` crate), synchronize with a mutex:
+  callbacks are called from different JVM threads.
+- Don't modify `new_data` (leave it null) — we only read, we don't patch
+  the loading.
+
+### D.2 Definer (force-loading via jopt-simple)
+```java
+// one class, WITHOUT anonymous ones (otherwise an extra $1.class -> NoClassDefFound)
+public final class Definer implements Runnable {
+  public static void kick() { new Thread(new Definer(), "definer").start(); }
+  public void run() {
+    ClassLoader cl = findClientLoader();          // by probing: Knot/Launch/…
+    for (String n : NAMES)                          // the list from a resource
+      try { Class.forName(n, false, cl); } catch (Throwable ignored) {}
+  }
+}
+```
+- The trigger is a call to `kick()` from `OptionParser.parse`/`<clinit>` (Class-File API
+  injection). Do NOT change the jar name on the classpath.
+- Java 8: rebuild with the system `zip` over the original (not the `jar` of a new JDK),
+  `javac --release 8 -XDstringConcat=inline`.
+- Afterwards — poke the client (run the code paths) and take a NEW dump.
+
+---
+
+## Appendix E. Removing obfuscation of valid bytecode
+
+This is not about decryption — it is about the readability of already valid classes. It is
+often asked NOT to touch it (leave flattening as is). But if asked — the techniques:
+
+- **Strings.** The strings lie encrypted and are decrypted by a static decoder
+  in `<clinit>` or on the first access. Removal: find the decoder method, RUN it
+  (by bytecode emulation or a mini-JVM runner) on each encrypted constant,
+  write the plaintext back into the pool. Typical obfuscators do a string decoder +
+  flow + name remap.
+- **Control-flow flattening.** A flat `tableswitch` dispatcher on a state variable
+  + opaque `iload N; ifne; athrow`. Restore the block order by the state
+  values; fold the opaque predicates (always true/false). CFR/Vineflower
+  pass structurally — this is cosmetics, take it only on an explicit request.
+- **invokedynamic obfuscation.** The real calls are hidden behind bootstrap methods.
+  Resolution: run the bootstrap (it returns a CallSite/MethodHandle) and label
+  which real target is behind each indy site.
+- **Name remap.** Classes/methods `a/b/c` — restore the meaning by behavior (what it
+  calls, which fields, strings). It is not solved automatically; give meaningful names as
+  the analysis goes, like in ordinary reversing.
+
+An OPCODE remap (section 6.2) is separate: it is not readability obfuscation but a
+substitution of the instruction set; without unwrapping it the class won't assemble at all.
+
+---
+
+## Appendix F. Glossary
+
+- **Metaspace** — the native JVM memory where the class structures live (not the heap).
+- **InstanceKlass** — the C++ description of a loaded class in the metaspace.
+- **ConstMethod** — the immutable part of a method (bytecode, sizes, name indexes).
+- **cpCache / ConstantPoolCache** — the cache of resolved references; it stores the mapping
+  quickened operand → constant pool index. Without it you can't de-rewrite.
+- **Quickened / rewritten bytecode** — the form of the bytecode in memory after linking
+  (fast_ opcodes, cpCache indexes instead of CP indexes).
+- **De-rewrite** — the reverse conversion quickened → standard bytecode.
+- **Hot/cold method** — called (the body is decrypted in the dump) / not called
+  (it remained ciphertext).
+- **ISR** — Instruction Set Randomization: the opcodes are permuted per class, the decoder
+  restores them at execution.
+- **Lift (lifting)** — recovering the logic: either decrypting a body by emulating the
+  decoder, or a native→Java translation of an FFI method.
+- **FFI native** — a method actually executed by a native lib; the bytecode is a decoy.
+- **Canary** — anti-dump junk at the start of a body (breaks a naive emit, verify off).
+- **Oracle** — a checking decompiler (CFR/Vineflower/javap).
+- **Definer** — the force-loading class that loads all classes via jopt before the dump.
+
+## Appendix G. Cheat sheet (quick start)
+
+```bash
+# 1. Profile
+file *.dmp *.exe *.dll
+unzip -p client.jar $(unzip -l client.jar | awk '/\.class/{print $4; exit}') | xxd | head -2   # magic
+strings jvm.dll | grep -iE 'internal|hotspot|jdk'                                              # version
+
+# 2. Reconstructor (own/project): build and run a batch over the package
+#    <tool> batch <dump> batch <out> <package_prefix>
+
+# 3. Probe the offsets (if calib/exports disagree)
+#    <tool> cpcache java/lang/String
+#    <tool> methprobe java/lang/Object
+
+# 4. Oracle
+java -jar cfr.jar out.jar --outputdir decomp
+#    stricter — Vineflower (standalone jar or bundled in Recaf):
+java -jar vineflower.jar out.jar decomp_vf
+#    structurally — javap:
+javap -c -p -classpath out.jar some/Class
+
+# 5. Top up the cold ones: decoder emulation (venv+Unicorn) / jopt-patch+re-dump / JVMTI agent
+python emu_all.py
+```
+
+---
+
+## Appendix H. A reconstructor in Rust: a working skeleton
+
+The core of all the work. Below is the mechanics in Rust code (fast scanning of a
+multi-gigabyte dump, precise byte handling, safe parallelism). It relies on `Dump` from
+section 5.2. This is not a finished product but a framework you finish for the build.
+
+### H.1 The offset model (one module per build)
+Keep the whole layout in one structure — for a new build you edit only it:
+```rust
+#[derive(Clone)]
+pub struct Layout {
+    // Klass / InstanceKlass
+    pub k_name: u64, pub k_super: u64, pub ik_access: u64,
+    pub ik_constants: u64, pub ik_methods: u64, pub ik_fields: u64,
+    // ConstantPool
+    pub cp_tags: u64, pub cp_cache: u64, pub cp_holder: u64,
+    pub cp_slot_base: u64, pub cp_major: u64, pub cp_src: u64,
+    // Method / ConstMethod
+    pub m_constmethod: u64, pub m_access: u64,
+    pub cm_constants: u64, pub cm_code_size: u64, pub cm_name: u64,
+    pub cm_sig: u64, pub cm_max_stack: u64, pub cm_max_locals: u64,
+    pub cm_codes: u64,
+    // ConstantPoolCache: array bases + strides
+    pub cpc_cp: u64, pub cpc_field: u64, pub cpc_method: u64, pub cpc_indy: u64,
+    pub rfe_stride: u64, pub rfe_cpidx: u64,
+    pub rme_stride: u64, pub rme_cpidx: u64,
+    pub rie_stride: u64, pub rie_cpidx: u64,
+}
+impl Layout { pub fn jdk21_resolved() -> Self { /* numbers from section 4.4 */ todo!() } }
+```
+
+### H.2 Metaspace scan: find all InstanceKlass
+```rust
+// InstanceKlass vtable: either from jvm.dll exports (rabin2 -E) or by calibration.
+pub fn find_klasses(dump: &Dump, vtable: u64) -> Vec<u64> {
+    let mut out = Vec::new();
+    // walk the metaspace regions in 8-byte steps, looking for objects whose
+    // first field == the InstanceKlass vtable.
+    for r in dump.metaspace_regions() {
+        let mut va = r.va;
+        while va + 8 <= r.va + r.size {
+            if dump.u64(va) == Some(vtable) { out.push(va); }
+            va += 8;
+        }
+    }
+    out
+}
+```
+Calibrating the vtable without exports (section 4.2): build a histogram of the first fields
+of all 8-aligned pointers in the image range; the candidate vtable is the most frequent
+pointer for which `+k_name` resolves to a valid Symbol in an anchor class.
+
+### H.3 Read a class and its methods
+```rust
+pub struct KlassView<'a> { d: &'a Dump, l: &'a Layout, ik: u64 }
+
+impl<'a> KlassView<'a> {
+    fn sym(&self, sym_ptr: u64) -> String {           // HotSpot Symbol: len@u16 +body
+        let len = self.d.read(sym_ptr + SYM_LEN_OFF, 2)
+            .map(|b| u16::from_le_bytes(b.try_into().unwrap())).unwrap_or(0) as usize;
+        let body = self.d.read(sym_ptr + SYM_BODY_OFF, len).unwrap_or(&[]);
+        String::from_utf8_lossy(body).into_owned()
+    }
+    pub fn name(&self)  -> String { self.sym(self.d.u64(self.ik + self.l.k_name).unwrap()) }
+    pub fn super_ik(&self) -> Option<u64> { self.d.u64(self.ik + self.l.k_super).filter(|&p| p!=0) }
+    pub fn constants(&self) -> u64 { self.d.u64(self.ik + self.l.ik_constants).unwrap() }
+
+    pub fn methods(&self) -> Vec<u64> {                // Array<Method*>: len@u32 + ptrs
+        let arr = self.d.u64(self.ik + self.l.ik_methods).unwrap();
+        let n = self.d.read(arr, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .unwrap_or(0) as u64;
+        (0..n).filter_map(|i| self.d.u64(arr + ARRAY_DATA_OFF + i*8)).collect()
+    }
+}
+```
+
+### H.4 Assembling a single method (Method → ConstMethod → bytecode)
+```rust
+pub struct MethodOut { pub name: String, pub desc: String,
+                       pub access: u16, pub code: Vec<u8>, pub cold: bool }
+
+pub fn build_method(d: &Dump, l: &Layout, cp: &ConstPool, m: u64) -> MethodOut {
+    let cm = d.u64(m + l.m_constmethod).unwrap();
+    let access = d.read(m + l.m_access, 2)
+        .map(|b| u16::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let code_size = d.read(cm + l.cm_code_size, 2)
+        .map(|b| u16::from_le_bytes(b.try_into().unwrap())).unwrap_or(0) as usize;
+    let name_i = d.read(cm + l.cm_name, 2).map(u16le).unwrap_or(0);
+    let sig_i  = d.read(cm + l.cm_sig,  2).map(u16le).unwrap_or(0);
+    // read window code_size+64, progressively (section 7.1)
+    let raw = d.read(cm + l.cm_codes, code_size + 64).unwrap_or(&[]).to_vec();
+    let end = natural_end(&raw, code_size);            // codelen::needed
+    let mut code = raw[..end].to_vec();
+    neutralize_canary(&mut code);                      // section 7.3
+    let cold = !verify_body(&code, cp, /*max_locals*/);// section 12
+    if !cold { derewrite(&mut code, d, l, cm, cp); }   // section 6 (not for decoded)
+    MethodOut { name: cp.utf8(name_i), desc: cp.utf8(sig_i),
+                access: normalize_access(access), code,
+                cold }                                  // cold -> native stub
+}
+```
+
+### H.5 The constant pool and writing the classfile
+`ConstPool` reads `cp_tags` + slots (Appendix B) and provides `utf8(idx)`. For
+writing the `.class` use the **`ristretto_classfile`** crate (round-trip of class files,
+instructions = a Vec with logical indexes) or write the bytes by hand. The Code attribute
+with `max_stack/max_locals` from ConstMethod; we omit the StackMapTable (the decompiler
+will survive). Cold methods → `ACC_NATIVE` without Code (constructors/`<clinit>` →
+an empty `return`).
+
+A known pitfall of `ristretto_classfile 0.32`: in `to_bytes` the StackMapTable breaks
+if the first frame sits at byte 0 (any loop) — it is fixed with a
+`[patch.crates-io]` to a local copy (one line in `attributes/attribute.rs`).
+If you generate Code yourself and don't write a StackMapTable — you won't hit it.
+
+### H.6 Batch and parallelism
+```rust
+use rayon::prelude::*;
+pub fn batch(dump: &Dump, l: &Layout, vtable: u64, prefix: &str, out: &JarWriter) {
+    let klasses = find_klasses(dump, vtable);
+    klasses.par_iter().for_each(|&ik| {                // thread pool, one class per task
+        let kv = KlassView { d: dump, l, ik };
+        let name = kv.name();
+        if !name.starts_with(prefix) { return; }        // target package only
+        match std::panic::catch_unwind(|| assemble_class(dump, l, &kv)) {
+            Ok(bytes) => out.put(&format!("{name}.class"), &bytes),
+            Err(_)    => log_fail(&name),                // a broken class doesn't kill the batch
+        }
+    });
+}
+```
+Scan the dump in chunks across the cores; cache the calibration (vtable+offsets) on disk,
+otherwise every run rescans. A progress bar with ETA. `catch_unwind` per class — one
+crooked class must not bring down the whole run.
+
+### H.7 The tool's env contract
+A single contract to link the reconstructor with the lift:
+- input: the dump path, the image extension (`.exe`/`.dll`), the package prefix;
+- `DECODED_CODES` — the path to the decrypted bodies from the Unicorn lift (section 8.4):
+  if set, `build_method` takes the bytes for cold ones from there with EMPTY maps
+  (decoded is pre-link, don't apply de-rewrite);
+- `OFFLINE_STUB` — emit default bodies instead of `native` (for launching, section 13);
+- the probe commands `cpcache`/`methprobe`/calibration print raw bytes (section 4.3).
+
+---
+
+## Appendix I. How to compose a "pull the classes" report
+
+A reconstruction report is not "I extracted N classes" but a reproducible map: what the
+protection is, what I got, how I checked it, what is left and why. The template (fill it in
+per the facts, without fluff or emoji):
+
+```
+# Reconstruction of <artifact name>
+
+## Protection
+- JDK: <version, whether the JVM is custom, markers>
+- JAR encryption: <magic, what stands instead of CAFEBABE / stub classes>
+- Where decryption is: <Java loader (Fabric/transformer) | native JVM | FFI> — how I determined it
+- Method bodies: <open | lazy encryption (splitmix/ISR/remap) | FFI native>
+- Strength (rough): <2/10 all code open … 6/10 lazy body encryption … higher with a lift>
+
+## What I got
+- Classes in the target: <X> out of <Y in the JAR/by the list>
+- Decompile cleanly: <Z> (oracle: CFR/Vineflower/javap)
+- Hot bodies: <%>, cold (ciphertext): <%>
+
+## How I got it
+- Offsets: <exports | calibration>, key numbers/anomalies of the build
+- De-rewrite: <cpCache legacy/resolved, indy direct/complement, opcode remap>
+- Emit: <natural end, exception filter, canary, flags>
+- Topping up the missing ones: <jopt-patch / JVMTI agent / more code paths / decoder emulation>
+
+## What is left and why
+- <N methods are cold — never called; top-up = re-dump with the features exercised>
+- <M methods are FFI native — a native->Java lift is needed, a separate task>
+- <obfuscation (flattening/indy) — valid, decompiles, untouched on request>
+
+## Delivery
+- <path to the classes/ folder>
+- <*-reconstructed.jar (size, what is inside)>
+- <decompiled sources, README>
+
+## Reproduction
+- <reconstructor command, env, tool version/offsets profile>
+```
+
+Report rules:
+- Count in terms of "decompiles cleanly", not "extracted" — extracting garbage is easy.
+- Separate facts and hypotheses: "the offset is confirmed against java/lang/Object" ≠ "looks like".
+- Explain each "left over" with a reason and state what will close the remainder.
+- Mark a wrong previous conclusion as refuted if new data removed it
+  (e.g. "the key is unrecoverable" → turned out to be deterministic).
+- Delivery — with paths and sizes, so the result can be picked up without you.
+
+## Appendix J. A diagnostic build and verification without interactivity
+
+The offline client is running, but the visuals/interactivity cannot be checked (no mouse/live
+GPU/headless). Do NOT pass off the unverified as done — INSTRUMENT it and hand over a
+diagnostic build, read what the user sends back (logs/screenshots/crash logs).
+- **An ASM instrumentation pass behind an env flag:** `Probe.log(...)` in the key methods
+  (read positions by REFLECTION, bypassing the superclass), `Snap.maybeSnap()` takes a frame
+  via `glReadPixels`. The resolve path/positions/state — into the log; the frame — into a PNG.
+- **Headless does NOT see everything:** in offscreen interactive appearance animations do
+  NOT tick; the font/glyph batch may not flush (immediate-mode shapes — do render); `Snap`
+  reads only part of the framebuffer if it hardcodes the size (take `GL_VIEWPORT`); a hook on
+  the wrong method (overlay vs active screen) catches the wrong frame. BUT headless PROVES:
+  the passes are applied, there is no crash, the positions (via Probe), the immediate-mode rendering.
+- **A crash trace is a GIFT, not a failure:** the stack proves the path executed (the click
+  got through, the handler ran). Read the trace as a map of the working pipeline.
+- **Change ONE thing at a time and take a frame:** isolate the cause with a binary search (position vs
+  size vs START/END of the insertion vs the size source). Don't pile 3 hypotheses into one build.
+- **Screenshot workflow:** launch in the background, `sleep 20-25`, powershell CopyFromScreen →
+  PNG, crop the window by title (EnumWindows→GetClientRect), read the PNG. Boot-to-window
+  ~15-25s → short timeouts. Mark risky unverifiable things as "test it".
+
+---
+
+## Appendix K. Recipes for recovering strings (runtime decode)
+
+Strings are almost always encrypted (native/static decoder, indy dispatcher). To take them
+without manual crypto reversing:
+- **DES/AES-from-heap-masterKey (no native reversing).** The only native entry is the
+  per-class `masterKey` (static-final long/byte[]), whose FINAL value is already in the heap
+  (a mirror static field). Take the masterKey + the ciphertext array (also static) from the
+  heap → decrypt in pure Java. Example (akrien): DES/CBC/PKCS5, key=8 BE bytes `l`,
+  per-call `n2 = n ^ (l & 0x7FFF) ^ const`, plaintext=modUTF8(DES_decrypt(cipher[n2]));
+  the `D.s/D.l` natives are no longer needed.
+- **Enum names in INSTANCE fields.** Obfuscated enums decode the name into an instance field
+  (not static) → static baking doesn't catch them → NPE on `name.length()`. Heap-recover:
+  dereference the static self-type field (enum constants) in the mirror, read the String
+  instance fields of each constant, bake them into the `<clinit>` tail.
+- **A global indy string dispatcher (two-pass deobf).** Often ONE "keystone" class
+  (tens of thousands of idyn through N bootstrap decoders + cipher tables). Pass-1: a FRESH
+  `URLClassLoader` PER CLASS (a shared counter desyncs the bulk-run → a cascading
+  IndexOutOfBounds), run the bootstrap → take `revealDirect` → the `idyn→target` map
+  (~97%). Pass-2: rewrite idyn→direct invoke/field/ldc. Or a full-replace of the
+  keystone's `<clinit>` with a/b/c/d/e baked from the heap (drop the native array-builder).
+- **Number-unfolding.** Reads from junk tables (`u[]/R[]/M[]`) into literals via a
+  CFG-solver (skip the NOP between the index and the load, remove the whole run); dead
+  tables/fillers LEFT (otherwise verification breaks).
+- **Native `string_pool`** — by emulating the native code (Appendix C.3): plaintext name+desc
+  for free as a side effect of the run.
+- **The registry is empty after deobf** (blocks/items): registration goes through
+  indy-reflection → bake the resolved slots as an EMPTY string (not null) so that
+  re-resolve works; exclude the `alreadyRegistered` flag baked true from a
+  full-init dump (otherwise registration is skipped by the no-op).
+
+---
+
+## Appendix L. Carving resources/assets out of the dump
+
+The client's textures/icons/fonts/sounds are cut out of the dump by signatures:
+- **PNG** (`\x89PNG…IEND`, validate IHDR w/h), **JPEG** (`\xFFD8FF…\xFFD9`,
+  parse SOF), **SVG** (`<svg…</svg>`), **OGG** (`OggS` pages), **TTF/OTF** (sfnt
+  table-dir / `OTTO`/`glyf`).
+- **Wallpapers/large textures often exist only as DECODED textures** in memory
+  (there is no compressed file) — only the raw RGBA is carved, not PNG/JPEG.
+- **Fonts parsed by freetype** may not carve in their source form →
+  substitute a standard TTF (`Font.createFont`+deriveFont).
+- Icons are often SVG in the reconstructed jar (they are rasterized into the font atlas at
+  runtime) — the reconstructed-from-dump jar itself is dump-derived → its SVG/lang/assets are
+  "from the dump".
+- Assets loaded by the native `getResourceAsStream0` from an encrypted container
+  (`.dat`/`.ivm`): absent in the dump if the container is stream-encrypted as a whole
+  (entropy 7.99 uniformly, no TOC) → take them only from a HOT dump (menu/world
+  loaded, resources decoded) or break the container cipher.
+- Take vanilla MC assets from the standard jar of the version / the asset-index (`objects/`
+  hash store), add `pack.mcmeta` (otherwise "Unable to parse language metadata").
+
+---
+
+## Appendix M. VM de-virtualization (virtualized bodies)
+
+The method body is not bytecode but a program for an embedded VM (Voile/GayVM/JTC/VxLang VM):
+- **Identify:** opcodes in the "forbidden" zone (0xEE-0xFF), a prologue marker (e.g.
+  `EF 00 00 00` / per-opcode), the method is marked not-compilable (the JIT doesn't read VM code).
+- **Find the parameters in the image:** global seeds (by RVA in jvm.dll/the core), per-opcode
+  salts (a table), the key derivation of the operand (e.g. `key=fold32(s0^s1)^g1^g2^const;
+  murmur3_fmix32(key)`, or splitmix). The permutation/state is often in a TLS hash table
+  (region @+0x10 = u16[len], a `skipfinal` flag in TLS).
+- **Tiers (classify, don't expect 100%):** (1) virtualized-with-prologue — de-virt by
+  reversing the interpreter or by running the decoder; (2) plain non-prologue fast bytecode
+  — standard; (3) scrambled without a per-address salt, session-fixed (the same plain →
+  the same cipher) — statically unrecoverable, only live-capture (HWBP on
+  interpreter-dispatch).
+- **Anti-emulation:** if the key/seed is mixed via x87 (fsin/fcos/fyl2x) — a host-FPU
+  emulator (15.6), not Unicorn's soft-FPU; dump memory — COW mapping.
+- **CP metadata of the protector:** if only the 16-bit REFERENCE field is scrambled and the
+  keystream formula is not cracked — take the real `_resolved_klasses` (CP+0x30/+0x28): the Class
+  entry low16 = the index → the real Klass → the name (descramble bypassing the cipher).
+
+---
+
+## Appendix N. The sp1cy-mulator emulator: a base for a specific VM
+
+If the project files include the SOURCE `D:\sp1cy-mulator` (a Rust workspace) — this is
+NOT a ready tool for your target but a **BASE of dump emulators**: a modular framework
+on which you write YOUR OWN emulator for the SPECIFIC VM/JVM. The idea is the same as in 8.4 —
+not to reverse the crypto by hand, but to EXECUTE the real native routine (decrypt/anti-dump/
+unpacking) on the dump memory.
+
+**Layout (crates-layers):**
+- `sp1cy-core` — the `Cpu`/`Loader`/`CallAbi`/`Reader`/`MemorySpace`/`Emulator` traits
+  (the base for all engines) + Win64 frame/scratch.
+- `sp1cy-dump` — `MinidumpLoader`(MDMP)/`PeLoader`(DLL/EXE)/`RawLoader`.
+- `sp1cy-unicorn` — a native x64 CPU on top of Unicorn (`--features unicorn`, needs
+  pkg-config+cmake+ninja+a C compiler; without them `info`/`profiles` are available).
+- `sp1cy-jvm` — a walker for HotSpot JDK21 (Klass/Method/ConstMethod/cpCache),
+  `offsets.rs`.
+- `sp1cy-protect` — protection profiles (`mintantileak`/`nursultan`/`rockstar`) = extension
+  points.
+- `sp1cy-cli` — the `sp1cy` binary: `info <dump>` / `info x.dll --pe` / `profiles` /
+  `call x.dll --pe --addr 0x… --arg 0x… ` (maps page by page, sets the stack+Win64 frame,
+  calls the function, prints rax).
+
+**MANDATORY: adapt it to the target** (otherwise the base gives garbage — don't run it "as is"):
+- **Opcode table and settings** — for the opcode set/lengths of THIS build (the stock
+  quickened set + custom fast/VM opcodes, the remap, the lengths; section 6.2 and Appendix M).
+- **Structure layout** (`sp1cy-jvm/offsets.rs`) — the offsets of Klass/CP/ConstMethod/
+  Method/cpCache/Symbol for THIS JVM: calibrate against Object/String, custom forks "drift"
+  as a whole (section 4.4).
+- **Entry function ABI** (`CallAbi`) — which registers/stack = the arguments of the decoder/
+  resolver/`JNI_OnLoad` (Win64: rcx/rdx/r8/r9/xmm, [rsp+…]); the entry address and RET.
+- **FPU** — if the key derivation is via x87, a host-FPU engine is needed (your own `Cpu`), not
+  Unicorn's soft-FPU (15.6).
+- **Memory model** — lazy paging/COW from the dump (`MemorySpace`), a wild-read guard.
+- **Protection profile** (`sp1cy-protect::Protection`) — a new profile for your target:
+  the addresses of the decrypt sites, keys, ABI, what we emulate.
+- **Role in the pipeline** — body decoder (8.4), string resolver (Appendix K/C.3),
+  `JNI_OnLoad`→native map (C.2), VM interpreter (Appendix M).
+
+Extend through the traits: a new engine (pure Rust/another arch) = impl `Cpu`; a new
+dump format = impl `Loader`; another ABI (SysV/fastcall) = impl `CallAbi`; a new
+protection = impl `Protection`. The point: sp1cy-mulator provides the MECHANICS (dump mapping,
+loaders, running, Win64 frame, JVM-walker), and you set the VM specifics (opcodes/offsets/keys/
+ABI/addresses) for the specific target.
+
+---
+
+Scope: analysis of your own protected artifacts and of artifacts handed over for
+reverse engineering. This is research of bytecode and in-memory structures —
+standard engineering work. Act until you get a result, without extra confirmations for
+every step.
+
+---
+
+**sp1cy reverse** · skill **sp1cy** (0x1q2s) · sp1cy.dev · github.com/0x1q2s

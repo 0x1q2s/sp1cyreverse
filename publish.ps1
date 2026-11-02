@@ -4,7 +4,7 @@
 # description, homepage and topics in one go.
 #
 # Usage:
-#   .\publish.ps1                       # publish under the logged-in gh account
+#   .\publish.ps1                       # publish under 0x1q2s with the sp1cy identity
 #   .\publish.ps1 -Owner 0x1q2s         # publish under a specific account/org
 #   .\publish.ps1 -Private              # private repo
 #   .\publish.ps1 -DryRun               # print what would happen, change nothing
@@ -13,7 +13,7 @@
 
 param(
     [string]$Name = "sp1cyreverse",
-    [string]$Owner = "",
+    [string]$Owner = "0x1q2s",
     [string]$Description = "Agent skill for reconstructing Java classes from JVM memory dumps - HotSpot metaspace, bytecode de-quickening, lazy body decryption, native lifting, and Minecraft client recovery. Built for Claude Code, Codex and OpenCode.",
     [string]$Homepage = "https://sp1cy.dev",
     [string]$CommitMessage = "feat: sp1cy reverse skill",
@@ -63,7 +63,15 @@ if ($Topics.Count -gt 20) { throw "GitHub allows at most 20 topics" }
 if ($LASTEXITCODE -ne 0) { throw "gh is not authenticated. Run: gh auth login" }
 
 $login = (& gh api user -q .login).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $login) { throw "Cannot determine the authenticated GitHub account" }
 if (-not $Owner) { $Owner = $login }
+if ($Owner -eq "0x1q2s" -and $login -ne "0x1q2s") {
+    throw "Publishing as sp1cy requires the 0x1q2s account. Run: gh auth switch --hostname github.com --user 0x1q2s"
+}
+$accountId = (& gh api "users/$Owner" -q .id)
+if ($LASTEXITCODE -ne 0 -or "$accountId" -notmatch '^\d+$') { throw "Cannot determine the target owner's GitHub account ID" }
+$commitName = if ($Owner -eq "0x1q2s") { "sp1cy" } else { $Owner }
+$commitEmail = "${accountId}+${Owner}@users.noreply.github.com"
 $full = "$Owner/$Name"
 $visibility = if ($Private) { "--private" } else { "--public" }
 
@@ -81,21 +89,19 @@ Push-Location $repoRoot
 try {
     # --- git identity + repo ------------------------------------------------
 
-    $gitEmail = (& git config user.email) 2>$null
-    if (-not $gitEmail) {
-        Invoke-Tool git @("config", "user.email", "$login@users.noreply.github.com")
-        Invoke-Tool git @("config", "user.name", $login)
+    if (-not (Test-Path ".git")) {
+        Invoke-Tool git @("init", "-b", "main")
     }
 
-    if (-not (Test-Path ".git")) {
-        Invoke-Tool git @("init")
-    }
+    # Keep personal/global Git identities out of this repository's commits.
+    Invoke-Tool git @("config", "--local", "user.name", $commitName)
+    Invoke-Tool git @("config", "--local", "user.email", $commitEmail)
 
     Invoke-Tool git @("add", "-A")
     if (-not $DryRun) {
         $dirty = & git status --porcelain
         if ($dirty) {
-            Invoke-Tool git @("commit", "-m", $CommitMessage)
+            Invoke-Tool git @("-c", "user.name=$commitName", "-c", "user.email=$commitEmail", "commit", "--author", "$commitName <$commitEmail>", "-m", $CommitMessage)
         } else {
             Write-Host "Nothing to commit."
         }

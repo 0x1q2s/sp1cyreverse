@@ -155,6 +155,9 @@ Maintainer publish:
 
 It creates (or reuses) the repo, pushes `main`, then sets the description,
 homepage and topics. Add `-Private` or `-DryRun` as needed.
+The default owner is `0x1q2s`; publishing to that account requires it to be
+active in `gh`. Commits use the `sp1cy` name and a GitHub noreply address,
+not your global Git name or personal email.
 
 ## Scope and legal
 
