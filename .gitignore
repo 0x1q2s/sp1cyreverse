@@ -1,0 +1,59 @@
+# Dumps and protected artifacts — never commit
+*.dmp
+*.mdmp
+*.core
+*.jar
+*.class
+*.dex
+*.apk
+*.dll
+*.exe
+*.sys
+*.pdb
+*.map
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.key
+*.pem
+
+# Working directories
+dumps/
+dump/
+work/
+workspace/
+out/
+output/
+decomp/
+decompiled/
+reconstructed/
+decoded/
+samples/
+target/
+build/
+dist/
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Rust
+Cargo.lock.bak
+
+# Editors / OS
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
